@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.1] - 2026-07-23
+
+### Fixed
+
+- **`gemini-flash-latest` and `gemini-pro-latest` aliases now win over
+  versioned entries when no version is pinned.** Previously, asking for
+  `flash` resolved to the highest version of the flash family (e.g.
+  `Gemini 3.6 Flash (Medium)`), which is a concrete snapshot — not
+  Google's "latest release" pointer. The resolver now prefers entries
+  with `version: null` (the aliases that `parseModelLine` produces from
+  names like `Gemini Flash Latest`) over versioned entries. Falls back
+  to the highest version if no alias is present in the catalog, so
+  older agy builds without `*-latest` entries keep working.
+- **Leading-dash values passed as `model` are rejected before reaching
+  argv.** A value like `--dangerously-skip-permissions` used to land
+  verbatim as the `--model` token; the tool now refuses it with a clear
+  error message, matching the `CONV_ID_RE` threat model already applied
+  to conversation ids.
+
+### Changed
+
+- `modelParam` is now a plain `Type.String()` instead of a conditional
+  `StringEnum` built from the live catalog. The enum was too restrictive
+  when discovery succeeded (the common case): any tiered or pinned
+  alias like `"flash high"` or `"3.5 flash"` failed AJV validation
+  before `resolveModel` ever saw it. Plain `Type.String()` lets the
+  resolver handle every documented form and falls back to agy for
+  unknown slugs. The now-unused `StringEnum` import is gone.
+
 ## [1.0.0] - 2026-07-07
 
 Initial release.

@@ -37,7 +37,7 @@ import {
 	getSettingsListTheme,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
-import { StringEnum } from "@earendil-works/pi-ai";
+
 import { Container, SettingsList, Text, type SettingItem } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
@@ -252,14 +252,27 @@ function resolveModel(
 		const versioned = candidates.filter((e) => e.version === version);
 		if (versioned.length > 0) candidates = versioned;
 	} else {
-		const versions = candidates
-			.map((e) => e.version)
-			.filter((v): v is string => v !== null)
-			.sort(compareVersionsDesc);
-		if (versions.length > 0) {
-			const top = versions[0];
-			const latest = candidates.filter((e) => e.version === top || e.version === null);
-			if (latest.length > 0) candidates = latest;
+		// Prefer Google's official `gemini-*-latest` aliases (entries with no
+		// parseable version in their name, e.g. "Gemini Flash Latest") when
+		// the user did NOT pin a specific version. The alias is the
+		// versionless pointer Google intends for "the current release" and
+		// hot-swaps on every release, while versioned entries like
+		// "Gemini 3.6 Flash (Medium)" stay available via explicit pinning
+		// (e.g. "3.6 flash medium"). Falls back to the highest versioned
+		// entry if no alias is present in the catalog.
+		const aliases = candidates.filter((e) => e.version === null);
+		if (aliases.length > 0) {
+			candidates = aliases;
+		} else {
+			const versions = candidates
+				.map((e) => e.version)
+				.filter((v): v is string => v !== null)
+				.sort(compareVersionsDesc);
+			if (versions.length > 0) {
+				const top = versions[0];
+				const latest = candidates.filter((e) => e.version === top);
+				if (latest.length > 0) candidates = latest;
+			}
 		}
 	}
 
@@ -382,8 +395,9 @@ interface AgyDetails {
 
 export default async function (pi: ExtensionAPI) {
 	const binary = resolveAgy();
-	// Discovered once at load; frozen for the session (including the
-	// StringEnum model param). Run /reload after an `agy update` to refresh.
+	// Discovered once at load; frozen for the session. Run /reload after an
+	// `agy update` to refresh. Failure is non-fatal: resolveModel falls back
+	// to passthrough so exact slugs typed by the user still work.
 	const discovered = await discoverModels(binary).catch(() => []);
 
 	// --- /agy: view / change default model + thinking ---------------------
@@ -498,27 +512,17 @@ export default async function (pi: ExtensionAPI) {
 
 	// --- Tool registration -------------------------------------------------
 
-	// Model param: free string (friendly alias OR exact). We surface the
-	// discovered models as a StringEnum when available so the model gets a
-	// bounded list, but also accept arbitrary input that resolves through
-	// the alias map. Description carries the alias grammar.
-	const modelParam = discovered.length
-		? Type.Optional(
-				StringEnum(
-					// Offer friendly aliases plus the full exact strings.
-					[...new Set([...MODEL_OPTIONS, ...discovered.map((e) => e.full)])],
-					{
-						description:
-							"Model alias or exact id. Friendly: 'flash' (latest Flash), 'pro' (latest Pro), 'gemini' (=flash). Add a tier: 'flash high', 'pro low'. Pin a version: '3.5 flash'. Exact: 'Gemini 3.5 Flash (Medium)'. Omit for the configured default.",
-					},
-				),
-			)
-		: Type.Optional(
-				Type.String({
-					description:
-						"Model alias or exact id. Friendly: 'flash', 'pro', 'gemini'. Add tier: 'flash high'. Omit for default.",
-				}),
-			);
+	// Model param: free string (friendly alias OR exact). Previously this
+	// was a StringEnum built from the live catalog; that made tiered/pinned
+	// aliases ("flash high", "3.5 flash") fail AJV validation before
+	// resolveModel ever saw them. Type.String() lets the resolver handle
+	// every documented form and falls back to agy for unknown slugs.
+	const modelParam = Type.Optional(
+		Type.String({
+			description:
+				"Model alias or exact id. Friendly: 'flash' (latest Flash, prefers the gemini-flash-latest alias), 'pro' (latest Pro, prefers gemini-pro-latest), 'gemini' (=flash). Add a tier: 'flash high', 'pro low'. Pin a version: '3.5 flash'. Exact: 'Gemini 3.5 Flash (Medium)'. Omit for the configured default.",
+		}),
+	);
 
 	pi.registerTool({
 		name: "AskAntigravity",
@@ -581,6 +585,21 @@ export default async function (pi: ExtensionAPI) {
 
 			const config = loadConfig();
 			const requestedModel = (params.model as string | undefined) ?? config.defaultModel;
+			// Defensive: reject leading-dash model values that could misbind
+			// on agy's arg parser when spliced as the `--model` value. Same
+			// threat model as CONV_ID_RE — a leading-dash value can't be a
+			// model id, so refuse it instead of letting it reach argv.
+			if (typeof params.model === "string" && params.model.trim().startsWith("-")) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `model value "${params.model}" starts with "-" — not a valid model id. Use a friendly alias (e.g. "flash", "pro", "gemini") or a known exact id (e.g. "Gemini 3.5 Flash (Medium)").`,
+						},
+					],
+					details: emptyDetails(requestedModel, null),
+				};
+			}
 			const resolved =
 				resolveModel(requestedModel, discovered, config.defaultThinking) ?? requestedModel;
 
