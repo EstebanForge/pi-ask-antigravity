@@ -54,6 +54,9 @@ const GLOBAL_CONFIG_PATH = path.join(os.homedir(), ".pi", "agent", "ask-antigrav
 
 const DEFAULT_MODEL = "flash";
 const DEFAULT_THINKING = "medium";
+// Default on: without --dangerously-skip-permissions, any run_command hangs in
+// non-interactive -p mode (accept-edits auto-approves edits, NOT commands).
+const DEFAULT_SKIP_PERMISSIONS = true;
 
 // Per-family fallback tier when none is specified and no config default.
 // Flash defaults to medium (per spec); Pro only ships Low/High, so "latest
@@ -146,6 +149,9 @@ interface ModelEntry {
 interface Config {
 	defaultModel: string;
 	defaultThinking: ThinkingTier;
+	/** Pass --dangerously-skip-permissions so commands don't hang on an
+	 *  unanswerable y/n prompt in non-interactive -p mode. Default true. */
+	skipPermissions: boolean;
 }
 
 // --- Version helpers -------------------------------------------------------
@@ -188,9 +194,16 @@ function loadConfig(): Config {
 	const thinking: ThinkingTier =
 		thinkingRaw === "low" || thinkingRaw === "high" ? thinkingRaw : "medium";
 
+	const envPerm = process.env.AGY_SKIP_PERMISSIONS;
+	const skipPermissions =
+		envPerm !== undefined
+			? envPerm === "1" || envPerm.toLowerCase() === "true"
+			: merged.skipPermissions === false ? false : DEFAULT_SKIP_PERMISSIONS;
+
 	return {
 		defaultModel: String(merged.defaultModel ?? DEFAULT_MODEL).trim() || DEFAULT_MODEL,
 		defaultThinking: thinking,
+		skipPermissions,
 	};
 }
 
@@ -367,6 +380,52 @@ function resolveAgy(): string {
 	return process.env.AGY_BIN || "agy";
 }
 
+// Defer to pi-antigravity-bridge when it is installed: the bridge provides BOTH
+// the streaming antigravity provider AND the AskAntigravity tool (same shape as
+// pi-claude-bridge). Registering the tool here too would create a duplicate.
+//
+// Detection does NOT rely on module resolution: pi loads each package with a
+// separate module root (docs/packages.md), so require.resolve from here never
+// reaches a sibling package. Instead we check:
+//   1. An in-process Symbol.for flag the bridge sets at its load (fast path
+//      when the bridge loaded earlier this session).
+//   2. The bridge's package.json at pi's documented install locations
+//      (~/.pi/agent/npm|git/... and project .pi/npm|git/...).
+//
+// Coverage: (2) is order-independent for npm/git installs - installation is a
+// fact on disk. For LOCAL/source installs (`pi install <path>`) the package
+// lives at its original checkout, not under .pi/npm|git/, so (2) sees nothing;
+// there only (1) helps, and only if the bridge loads first. Recommendation for
+// dev with both repos checked out side-by-side: install the bridge first so it
+// is earlier in settings.json (pi loads extensions in that order). If the
+// clash still occurs, both tools are functionally identical, so the only
+// symptom is a duplicate-name TUI warning - not broken behavior.
+const BRIDGE_FLAG = Symbol.for("pi-antigravity-bridge:active");
+
+function bridgeInstallPaths(): string[] {
+	const npmPkg = path.join("@estebanforge", "pi-antigravity-bridge", "package.json");
+	const gitPkg = path.join("EstebanForge", "pi-antigravity-bridge", "package.json");
+	const home = os.homedir();
+	const cwd = process.cwd();
+	return [
+		path.join(home, ".pi", "agent", "npm", "node_modules", npmPkg),
+		path.join(cwd, ".pi", "npm", "node_modules", npmPkg),
+		path.join(home, ".pi", "agent", "git", "github.com", gitPkg),
+		path.join(cwd, ".pi", "git", "github.com", gitPkg),
+	];
+}
+
+const isBridgeInstalled = (): boolean => {
+	if ((globalThis as Record<symbol, unknown>)[BRIDGE_FLAG]) return true;
+	return bridgeInstallPaths().some((p) => {
+		try {
+			return fs.existsSync(p);
+		} catch {
+			return false;
+		}
+	});
+};
+
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /** Query `agy models`. Returns [] on any failure (non-fatal). */
@@ -441,13 +500,124 @@ function snapshotConversations(dir: string): Set<string> {
 	return out;
 }
 
-/** Find the single new conversation id created since `before`. Returns null if
- *  none, or if several appeared (can't safely pick which one is ours). */
-function newConversationId(dir: string, before: Set<string>): string | null {
+/** Resolve which of the `candidates` DB ids is held open by the process tree
+ *  rooted at `rootPid`. Used to disambiguate concurrent agy runs. Returns the
+ *  single matching id, or null when none/several are open or /proc is
+ *  unavailable. Ported from pi-antigravity-bridge src/discovery.ts; keep in
+ *  sync. */
+type OpenDbResolver = (
+	rootPid: number,
+	dir: string,
+	candidates: Set<string>,
+) => string | null;
+
+function readProcStat(pid: number): { pid: number; ppid: number } | null {
+	let raw: string;
+	try {
+		raw = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+	} catch {
+		return null;
+	}
+	const closeParen = raw.lastIndexOf(")");
+	if (closeParen < 0) return null;
+	const fields = raw.slice(closeParen + 2).trim().split(/\s+/);
+	const ppid = Number(fields[1]);
+	if (!Number.isFinite(ppid)) return null;
+	return { pid, ppid };
+}
+
+function collectDescendants(rootPid: number): Set<number> {
+	const out = new Set<number>([rootPid]);
+	let entries: string[];
+	try {
+		entries = fs.readdirSync("/proc");
+	} catch {
+		return out;
+	}
+	const ppidOf = new Map<number, number>();
+	for (const e of entries) {
+		if (!/^\d+$/.test(e)) continue;
+		const s = readProcStat(Number(e));
+		if (s) ppidOf.set(s.pid, s.ppid);
+	}
+	let changed = true;
+	while (changed) {
+		changed = false;
+		for (const [pid, ppid] of ppidOf) {
+			if (out.has(pid)) continue;
+			if (out.has(ppid)) {
+				out.add(pid);
+				changed = true;
+			}
+		}
+	}
+	return out;
+}
+
+function safeRealpath(p: string): string | null {
+	try {
+		return fs.realpathSync(p);
+	} catch {
+		return null;
+	}
+}
+
+const procTreeOpenDbResolver: OpenDbResolver = (rootPid, dir, candidates) => {
+	if (candidates.size <= 1) return null;
+	if (process.platform !== "linux") return null;
+	const dirResolved = safeRealpath(dir);
+	const tree = collectDescendants(rootPid);
+	const found = new Set<string>();
+	for (const pid of tree) {
+		let fds: string[];
+		try {
+			fds = fs.readdirSync(`/proc/${pid}/fd`);
+		} catch {
+			continue;
+		}
+		for (const fd of fds) {
+			let target: string;
+			try {
+				target = fs.readlinkSync(`/proc/${pid}/fd/${fd}`);
+			} catch {
+				continue;
+		}
+			const base = path.basename(target);
+			if (!base.endsWith(".db")) continue;
+			if (dirResolved && safeRealpath(path.dirname(target)) !== dirResolved) continue;
+			const id = base.slice(0, -3);
+			if (candidates.has(id)) found.add(id);
+		}
+	}
+	if (found.size === 1) return [...found][0] ?? null;
+	return null;
+};
+
+interface BindOptions {
+	pid?: number;
+	resolveOpenDb?: OpenDbResolver;
+}
+
+/** Find the conversation id created since `before`. Returns null when none
+ *  appeared, or when several appeared and we cannot tie one to our process.
+ *  Pass `opts.pid` (the spawned agy) to enable concurrent-run disambiguation
+ *  via the process-tree FD scan. */
+function newConversationId(
+	dir: string,
+	before: Set<string>,
+	opts: BindOptions = {},
+): string | null {
 	const created = [...snapshotConversations(dir)].filter((id) => !before.has(id));
 	if (created.length === 0) return null;
-	if (created.length > 1) return null; // ambiguous; refuse to bind
-	return created[0] ?? null;
+	if (created.length === 1) return created[0] ?? null;
+	// Ambiguous: try to authoritatively identify ours via the spawned
+	// process's open files. Fail safe to null when we can't pick exactly one.
+	if (opts.pid !== undefined) {
+		const resolve = opts.resolveOpenDb ?? procTreeOpenDbResolver;
+		const hit = resolve(opts.pid, dir, new Set(created));
+		if (hit && created.includes(hit)) return hit;
+	}
+	return null;
 }
 
 // --- Extension -------------------------------------------------------------
@@ -466,6 +636,12 @@ interface AgyDetails {
 }
 
 export default async function (pi: ExtensionAPI) {
+	// If pi-antigravity-bridge is installed, it owns the AskAntigravity tool
+	// (and the provider). Stay silent and register nothing to avoid a
+	// duplicate-tool clash. Without the bridge, this extension behaves as
+	// before (standalone tool).
+	if (isBridgeInstalled()) return;
+
 	const binary = resolveAgy();
 	// Discovered once at load; frozen for the session. Run /reload after an
 	// `agy update` to refresh. Failure is non-fatal: resolveModel falls back
@@ -494,6 +670,7 @@ export default async function (pi: ExtensionAPI) {
 						`AskAntigravity config`,
 						`  defaultModel:    ${config.defaultModel}`,
 						`  defaultThinking: ${config.defaultThinking}`,
+						`  permissions:     ${config.skipPermissions ? "auto-approved" : "prompt"}`,
 						`  resolved:        ${resolveModel(config.defaultModel, discovered, config.defaultThinking) ?? "(agy default)"}`,
 						``,
 						`Edit: ~/.pi/agent/ask-antigravity.json`,
@@ -527,6 +704,14 @@ export default async function (pi: ExtensionAPI) {
 					currentValue: config.defaultThinking,
 					values: THINKING_OPTIONS,
 				},
+				{
+					id: "permissions",
+					label: "Permissions",
+					description:
+						"auto-approved: --dangerously-skip-permissions (required so run_command doesn't hang in -p mode). prompt: agy asks y/n (hangs non-interactively).",
+					currentValue: config.skipPermissions ? "auto-approved" : "prompt",
+					values: ["auto-approved", "prompt"],
+				},
 			];
 
 			const pending: Partial<Config> = {};
@@ -548,6 +733,8 @@ export default async function (pi: ExtensionAPI) {
 							pending.defaultModel = alias;
 						} else if (id === "defaultThinking") {
 							pending.defaultThinking = newValue as ThinkingTier;
+						} else if (id === "permissions") {
+							pending.skipPermissions = newValue === "auto-approved";
 						}
 					},
 					() => done(undefined),
@@ -742,6 +929,10 @@ export default async function (pi: ExtensionAPI) {
 			if (extra.length) args.push(...extra);
 			if (resolved) args.push("--model", resolved);
 			args.push("--mode", mode);
+			// accept-edits auto-approves file edits but NOT shell commands, so a
+			// run_command would hang on an unanswerable y/n prompt in non-interactive
+			// -p mode. Honor the shared permissions setting (same knob as the bridge).
+			if (config.skipPermissions) args.push("--dangerously-skip-permissions");
 			if (isContinuation) args.push("--conversation", rawConvId as string);
 			args.push("--print-timeout", `${timeoutMin}m`);
 			args.push("-p", finalPrompt);
@@ -779,6 +970,11 @@ export default async function (pi: ExtensionAPI) {
 				: null;
 
 			try {
+				// Bind the conversation id DURING the run (agy is alive then) so the
+				// pid-based /proc FD resolver can disambiguate when a concurrent agy
+				// also drops a new .db. Awaited after the run; the post-exit loop
+				// below is the fallback for runs that exit before the poll binds.
+				let bindDuringRun: Promise<void> = Promise.resolve();
 				const outcome = await new Promise<{
 					exitCode: number;
 					aborted: boolean;
@@ -805,6 +1001,28 @@ export default async function (pi: ExtensionAPI) {
 					proc.stderr?.on("data", (d: string) => {
 						details.stderr += d;
 					});
+
+					// Concurrent bind: poll for the new id while agy is alive. The FD
+					// resolver needs a live process tree, so this stops (and the
+					// post-exit fallback below takes over) once agy has exited.
+					if (!isContinuation && snapshot && proc.pid) {
+						bindDuringRun = (async () => {
+							for (let attempt = 0; attempt < DISCOVERY_POLL_ATTEMPTS; attempt++) {
+								if (details.conversationId) return;
+								if (proc.exitCode !== null) return; // agy gone: scan useless now
+								const found = newConversationId(CONVERSATIONS_DIR, snapshot, {
+									pid: proc.pid,
+								});
+								if (found) {
+									details.conversationId = found;
+									return;
+								}
+								await sleep(DISCOVERY_POLL_MS);
+							}
+						})().catch(() => {
+							/* best-effort: a bind error must never fail an otherwise-OK turn */
+						});
+					}
 
 					let sigkillTimer: ReturnType<typeof setTimeout> | undefined;
 					let watchdog: ReturnType<typeof setTimeout> | undefined;
@@ -871,6 +1089,10 @@ export default async function (pi: ExtensionAPI) {
 				});
 
 				if (statusInterval) clearInterval(statusInterval);
+
+				// Let the during-run bind poll finish (it bails immediately once agy
+				// has exited, so this rarely blocks).
+				await bindDuringRun;
 
 				details.exitCode = outcome.exitCode;
 				details.aborted = outcome.aborted;

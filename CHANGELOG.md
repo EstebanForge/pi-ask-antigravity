@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.0] - 2026-07-26
+
+### Added
+
+- **`permissions` config + `/agy` row + `AGY_SKIP_PERMISSIONS` env.** Controls
+  the new flag. Default `auto-approved` (required for non-interactive use); set
+  to `prompt` (`/agy` picker, or `AGY_SKIP_PERMISSIONS=0`) to disable - but
+  then any `run_command` hangs until you kill the call. Matches the bridge's
+  permissions knob.
+
+### Changed
+
+- **Defers to `pi-antigravity-bridge` when it is installed.** The bridge now
+  ships both the streaming antigravity provider AND the `AskAntigravity` tool
+  (same shape as `pi-claude-bridge`). To avoid a duplicate-tool clash, this
+  extension detects the bridge at load and, if present, registers nothing -
+  silently. Detection does not use module resolution (pi isolates each
+  package's module root); it checks an in-process `Symbol.for` flag the bridge
+  sets AND the bridge's package.json at pi's install paths
+  (`@estebanforge/pi-antigravity-bridge/package.json`). Order-independent for
+  npm/git installs; for local/source installs relies on the in-process flag
+  (install the bridge first so it loads first). Without the bridge, behavior is
+  unchanged.
+
+### Fixed
+
+- **`run_command` no longer hangs the tool.** `--mode accept-edits` auto-approves
+  file edits but NOT shell commands, so any task that triggered a `run_command`
+  hung forever on an unanswerable `y/n` prompt in non-interactive `-p` mode
+  (same root cause the pi-antigravity-bridge provider hit). The tool now passes
+  `--dangerously-skip-permissions` by default. Backported from the bridge.
+
 ## [1.1.0] - 2026-07-25
 
 ### Fixed
