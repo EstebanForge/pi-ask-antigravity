@@ -51,11 +51,40 @@ Verbose `agy models` strings (`Gemini 3.5 Flash (Medium)`) are hostile to natura
 | `pro low` | latest Pro, Low |
 | `3.5 flash` | pinned version, default tier |
 | `3.1 pro` | pinned Pro version (→ High) |
+| `sonnet` | Claude Sonnet 4.6 (Thinking) |
+| `opus` | Claude Opus 4.6 (Thinking) |
+| `gpt-oss` | GPT-OSS 120B (Medium) |
 | `Gemini 3.5 Flash (Medium)` | exact passthrough |
 
 - **Latest** = highest version number available for the family.
 - **Default tier**: Flash → Medium, Pro → High. Overridable per-config (below).
 - When a tier is unavailable for a family, the nearest is chosen with ties broken toward the higher tier (so "latest and greatest" wins).
+- The non-Gemini aliases (`sonnet`, `opus`, `gpt-oss`) are a static overlay merged with the live `agy models` catalog. Live entries always win on case-insensitive full-string equality, so an updated `agy` listing takes precedence over the hardcoded fallback.
+
+## Execution modes (`mode`)
+
+| Mode | Flag | Use when |
+| --- | --- | --- |
+| `plan` | `--mode plan` | agy reviews and plans without writing. Use for cross-review and read-only tasks. |
+| `accept-edits` (default) | `--mode accept-edits` | agy applies edits directly inside the workspace. |
+
+For agy's orthogonal `--sandbox` shell-containment flag, set `AGY_EXTRA_ARGS=--sandbox` in your environment. The extension does not expose it as a `mode` value because `--sandbox` controls command containment, not edit persistence.
+
+Recommended pairings:
+
+```text
+# Gemini produces, Claude reviews
+AskAntigravity prompt="Implement the approved refactor" mode=accept-edits
+AskAntigravity prompt="Review the resulting diff" model=opus mode=plan digest=true
+
+# Claude produces, Gemini reviews
+AskAntigravity prompt="Fix the parser root cause" model=opus mode=accept-edits
+AskAntigravity prompt="Review the resulting diff" model=pro mode=plan digest=true
+```
+
+## Compact output (`digest`)
+
+Set `digest: true` to prefix the prompt with `(Use compact digests, not full file contents.)` so `agy` returns summaries instead of full file payloads. Defaults on for `plan`, off for `accept-edits`. Use `true` for any read-only call (review, exploration, planning) where full file contents are noise.
 
 ## Configuration
 
@@ -84,8 +113,9 @@ Interactive picker for the default model and default thinking. If the project co
 | `prompt` | yes | Self-contained task. agy cannot see the Pi conversation. |
 | `cwd` | no | Workspace agy runs in. Defaults to the project root. |
 | `model` | no | Alias or exact id. Omit for the configured default. |
+| `mode` | no | `plan` (review-only) or `accept-edits` (agy applies edits, default). |
+| `digest` | no | Prefix the prompt with `(Use compact digests, not full file contents.)`. Defaults on for `plan`, off for `accept-edits`. |
 | `conversationId` | no | Omit for a one-shot (agy starts fresh). Pass the id from a prior call's result (`details.conversationId`) to resume that agy conversation with full context. See [Two modes](#two-modes-one-shot-vs-continued-conversation). |
-| `skipPermissions` | no | Pass `--dangerously-skip-permissions`. Needed for mutating tasks. |
 | `timeoutMinutes` | no | Hard cap on the run. Default 10. |
 
 ## Environment

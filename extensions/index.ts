@@ -66,16 +66,70 @@ const FAMILY_DEFAULT_TIER: Record<Family, ThinkingTier> = {
 
 const TIER_RANK: Record<ThinkingTier, number> = { low: 0, medium: 1, high: 2 };
 
+// Mode = which agy tool-loop policy to apply. Distinct from the alias layer.
+//   "plan"         → --mode plan     (no edits; review-only)
+//   "accept-edits" → --mode accept-edits (agy applies edits)
+//
+// Note: agy's --sandbox flag is an orthogonal shell-containment setting
+// (not an "edit preview" mode), so it is not exposed here. Users who need
+// it can pass it via the AGY_EXTRA_ARGS env var.
+type Mode = "plan" | "accept-edits";
+
+// Static alias overlay for non-Gemini models agy may or may not surface in
+// `agy models` depending on plan. When the live catalog contains an entry
+// whose full string equals the overlay target, the live entry wins. When it
+// does not (older agy, missing model, plan gate), the overlay entry resolves
+// the alias so the user can still type "sonnet" and get a working answer.
+//   "sonnet"   -> Claude Sonnet 4.6 (Thinking)
+//   "opus"     -> Claude Opus 4.6 (Thinking)
+//   "gpt-oss"  -> GPT-OSS 120B (Medium)
+const STATIC_ALIAS_OVERLAY: ReadonlyArray<ModelEntry> = [
+	{ full: "Claude Sonnet 4.6 (Thinking)", family: "other", version: null, tier: null },
+	{ full: "Claude Opus 4.6 (Thinking)", family: "other", version: null, tier: null },
+	{ full: "GPT-OSS 120B (Medium)", family: "other", version: null, tier: null },
+];
+
+// Short alias → overlay full string. Used by resolveModel to recognize
+// friendly short names ("sonnet") that the family-parser (flash/pro) does
+// not match. The overlay entries are also merged into the live catalog for
+// exact-string passthrough, so this map only needs to cover the short names.
+const STATIC_SHORT_ALIAS: ReadonlyMap<string, string> = new Map([
+	["sonnet", "Claude Sonnet 4.6 (Thinking)"],
+	["opus", "Claude Opus 4.6 (Thinking)"],
+	["gpt-oss", "GPT-OSS 120B (Medium)"],
+]);
+
+/** Merge the live catalog with the static alias overlay. Live entries win on
+ *  case-insensitive full-string equality so an updated `agy models` listing
+ *  always takes precedence over the hardcoded fallback. */
+function mergeCatalog(live: ModelEntry[]): ModelEntry[] {
+	const seen = new Set(live.map((e) => e.full.toLowerCase()));
+	const merged = [...live];
+	for (const entry of STATIC_ALIAS_OVERLAY) {
+		if (!seen.has(entry.full.toLowerCase())) merged.push(entry);
+	}
+	return merged;
+}
+
 // agy conversation ids are UUID DB-stems (e.g. "9e6fdc2f-f9f9-4096-95fc-7852528b50cc").
 // Reject anything that isn't, so a leading-dash value can't misbind on agy's
-// arg parser as the token after --conversation.
-const CONV_ID_RE = /^[A-Za-z0-9]{1,128}$/;
+// arg parser as the token after --conversation. First char must be
+// alphanumeric (rejects leading-dash flag injection); hyphens allowed in the
+// body because real UUIDs contain them.
+const CONV_ID_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,127}$/;
 
 const AGY_DESCRIPTION = `Delegate a self-contained sub-task to Google Antigravity. agy is the CLI for Gemini, so this tool is reached under three equivalent names the user may use interchangeably: **gemini**, **antigravity**, and **agy**. When the user says "ask gemini", "ask antigravity", "ask agy", or otherwise refers to any of these, call THIS tool. agy runs its OWN tool loop: it can read, write, edit, and execute inside the workspace, then returns its final answer. Use for a second opinion from a different model family, Gemini-specific reasoning, or isolated sub-tasks you do not need to drive step-by-step. Provide a complete, self-contained task description; agy will not see this conversation.
 
 TWO MODES (you choose):
 - **One-shot (isolated)**: omit conversationId. agy starts fresh with no memory of prior calls. Use for independent questions.
-- **Continued conversation**: pass the conversationId returned in the PREVIOUS call's details (details.conversationId). agy resumes that conversation with full context intact — use for follow-ups, multi-turn refinement, or when the user says "ask agy to follow up / continue / now do X based on what you just did". Thread the id from each result into the next call.`;
+- **Continued conversation**: pass the conversationId returned in the PREVIOUS call's details (details.conversationId). agy resumes that conversation with full context intact — use for follow-ups, multi-turn refinement, or when the user says "ask agy to follow up / continue / now do X based on what you just did". Thread the id from each result into the next call.
+
+EXECUTION MODES (param: mode):
+- **plan**: agy reviews and plans without writing. Use for cross-review and read-only tasks.
+- **accept-edits** (default): agy applies edits directly inside the workspace.
+- For agy's orthogonal \`--sandbox\` shell-containment flag, set the \`AGY_EXTRA_ARGS=--sandbox\` env var.
+
+COMPACT OUTPUT (param: digest): when true, the prompt is prefixed to request compact digests instead of full file contents. Defaults on for plan, off for accept-edits. Use true whenever you do not need full file payloads (review, exploration, planning).`;
 
 // --- Types -----------------------------------------------------------------
 
@@ -224,6 +278,22 @@ function resolveModel(
 	// 1. Exact full-string match (case-insensitive).
 	const exact = entries.find((e) => e.full.toLowerCase() === lower);
 	if (exact) return exact.full;
+
+	// 1b. Static short alias ("sonnet" / "opus" / "gpt-oss"). Checked
+	//     before the family parser because none of these names contain
+	//     "flash" or "pro" and would otherwise return null below. The
+	//     resolved full string is then re-validated against the catalog
+	//     in step 1's second pass on the next call, so renaming the
+	//     overlay entry in code still wins on exact-string match.
+	//     The case-insensitive lookup matches mergeCatalog's dedup logic
+	//     so the "live entries win" guarantee holds even when agy lists
+	//     the model under different casing than the overlay.
+	if (STATIC_SHORT_ALIAS.has(lower)) {
+		const target = STATIC_SHORT_ALIAS.get(lower) as string;
+		const targetLower = target.toLowerCase();
+		const fromCatalog = entries.find((e) => e.full.toLowerCase() === targetLower);
+		return fromCatalog ? fromCatalog.full : target;
+	}
 
 	// 2. Parse the alias.
 	let family: Family | null = lower.includes("flash")
@@ -385,6 +455,8 @@ function newConversationId(dir: string, before: Set<string>): string | null {
 interface AgyDetails {
 	model: string | null;
 	resolvedModel: string | null;
+	mode: Mode;
+	digest: boolean;
 	conversationId: string | null;
 	exitCode: number;
 	aborted: boolean;
@@ -397,8 +469,10 @@ export default async function (pi: ExtensionAPI) {
 	const binary = resolveAgy();
 	// Discovered once at load; frozen for the session. Run /reload after an
 	// `agy update` to refresh. Failure is non-fatal: resolveModel falls back
-	// to passthrough so exact slugs typed by the user still work.
-	const discovered = await discoverModels(binary).catch(() => []);
+	// to passthrough so exact slugs typed by the user still work. The static
+	// alias overlay (sonnet / opus / gpt-oss) is merged on top so those
+	// aliases resolve even when agy doesn't surface them in the live catalog.
+	const discovered = mergeCatalog(await discoverModels(binary).catch(() => []));
 
 	// --- /agy: view / change default model + thinking ---------------------
 
@@ -539,10 +613,23 @@ export default async function (pi: ExtensionAPI) {
 				}),
 			),
 			model: modelParam,
-			skipPermissions: Type.Optional(
+			mode: Type.Optional(
+				Type.Union(
+					[
+						Type.Literal("plan"),
+						Type.Literal("accept-edits"),
+					],
+					{
+						description:
+							"agy execution mode. 'plan' = review-only, no edits (--mode plan). 'accept-edits' = agy applies edits directly (--mode accept-edits, default). For agy's orthogonal --sandbox shell-containment flag, set the AGY_EXTRA_ARGS env var.",
+						default: "accept-edits",
+					},
+				),
+			),
+			digest: Type.Optional(
 				Type.Boolean({
 					description:
-						"Pass --dangerously-skip-permissions so agy auto-approves its own write/edit/exec tool calls. Required for tasks that mutate files. Use with care.",
+						"Request compact digests instead of full file contents. When true, the prompt is prefixed with '(Use compact digests, not full file contents.)'. Defaults on for plan, off for accept-edits.",
 				}),
 			),
 			conversationId: Type.Optional(
@@ -573,6 +660,8 @@ export default async function (pi: ExtensionAPI) {
 					details: {
 						model: null,
 						resolvedModel: null,
+						mode: "accept-edits",
+						digest: false,
 						conversationId: null,
 						exitCode: 0,
 						aborted: false,
@@ -636,18 +725,32 @@ export default async function (pi: ExtensionAPI) {
 				typeof rawConvId === "string" && rawConvId.length > 0 && CONV_ID_RE.test(rawConvId);
 			const snapshot = isContinuation ? null : snapshotConversations(CONVERSATIONS_DIR);
 
+			const mode: Mode = (params.mode as Mode | undefined) ?? "accept-edits";
+			// digest default: on for plan (review-only contexts where full file
+			// contents are noise), off for accept-edits (agy applies edits and
+			// may need richer context for diffs).
+			const useDigest: boolean =
+				typeof params.digest === "boolean"
+					? params.digest
+					: mode === "plan";
+			const finalPrompt: string = useDigest
+				? `(Use compact digests, not full file contents.)\n${params.prompt}`
+				: params.prompt;
+
 			const args: string[] = ["--add-dir", cwd];
 			const extra = extraArgs();
 			if (extra.length) args.push(...extra);
 			if (resolved) args.push("--model", resolved);
-			if (params.skipPermissions) args.push("--dangerously-skip-permissions");
+			args.push("--mode", mode);
 			if (isContinuation) args.push("--conversation", rawConvId as string);
 			args.push("--print-timeout", `${timeoutMin}m`);
-			args.push("-p", params.prompt);
+			args.push("-p", finalPrompt);
 
 			const details: AgyDetails = {
 				model: requestedModel,
 				resolvedModel: resolved,
+				mode,
+				digest: useDigest,
 				conversationId: isContinuation ? (rawConvId as string) : null,
 				exitCode: 0,
 				aborted: false,
@@ -866,6 +969,8 @@ function emptyDetails(model: string | null, resolvedModel: string | null): AgyDe
 	return {
 		model,
 		resolvedModel,
+		mode: "accept-edits",
+		digest: false,
 		conversationId: null,
 		exitCode: 0,
 		aborted: false,

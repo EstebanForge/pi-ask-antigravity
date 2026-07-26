@@ -2,6 +2,72 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0] - 2026-07-25
+
+### Fixed
+
+- **`CONV_ID_RE` rejected real agy conversation ids, silently breaking the
+  "continued conversation" feature.** The regex was
+  `/^[A-Za-z0-9]{1,128}$/` (no hyphens in the character class), but agy
+  conversation ids are hyphenated UUIDs (e.g.
+  `9e6fdc2f-f9f9-4096-95fc-7852528b50cc`, the very example in the source
+  comment). Every legitimate id failed validation, so `isContinuation`
+  was always `false`, `--conversation <id>` was never passed, and every
+  "continued" call quietly started a brand-new agy conversation instead
+  of resuming. Now allows hyphens in the body
+  (`/^[A-Za-z0-9][A-Za-z0-9-]{0,127}$/`) while preserving the threat
+  model: first char must be alphanumeric, so leading-dash flag-injection
+  values are still rejected. Present since 1.0.0; found by peer review.
+
+### Added
+
+- **`mode` parameter** — replaces the previous `skipPermissions` boolean
+  with an explicit two-way enum: `plan` (review-only, `--mode plan`) and
+  `accept-edits` (agy applies edits, `--mode accept-edits`, default).
+  Use `plan` for cross-review and read-only tasks, `accept-edits` for
+  implementation.
+- **`digest` parameter** — when true, the prompt is prefixed with
+  `(Use compact digests, not full file contents.)` to keep `agy` from
+  returning full file payloads. Default: `true` for `plan`,
+  `false` for `accept-edits`. Override per call.
+- **Non-Gemini alias overlay** — `sonnet`, `opus`, and `gpt-oss` now
+  resolve to the exact agy strings `Claude Sonnet 4.6 (Thinking)`,
+  `Claude Opus 4.6 (Thinking)`, and `GPT-OSS 120B (Medium)`. A
+  static short-alias map is checked before the family parser, so
+  these names resolve even when `agy models` does not surface them
+  in the live catalog (older agy builds, plan-gated models). The
+  overlay entries are also merged with the live catalog at
+  extension load; live entries always win on case-insensitive
+  full-string equality, so an updated `agy models` listing takes
+  precedence over the hardcoded fallback. Borrowed from
+  `@bacnh85/pi-agy`'s static model map.
+- **Effective `mode` and `digest` surfaced in `details`** — every
+  tool result now reports the resolved mode and whether the digest
+  prefix was applied, so the orchestrating model (and humans reading
+  logs) can see what flags were actually passed to `agy`.
+- **Case-insensitive live-catalog lookup for overlay aliases.** When
+  `sonnet` / `opus` / `gpt-oss` resolve via the overlay, the lookup
+  against the live catalog is now case-insensitive so the
+  "live entries win" guarantee holds even if `agy models` lists the
+  same model under different casing than the hardcoded overlay.
+  Matches `mergeCatalog`'s dedup logic.
+
+### Changed
+
+- **Breaking: `skipPermissions` parameter is removed.** Use `mode`
+  instead. The previous `skipPermissions: true` (which passed
+  `--dangerously-skip-permissions`) was a coarse proxy for the new
+  `mode: "accept-edits"` and is no longer the right primitive. Use
+  `mode: "plan"` for review-only flows. No callers in the wild
+  depend on the old boolean (the package shipped 2026-07-07), so
+  the break is contained to a single minor bump.
+- **No `sandbox` enum value.** A peer review caught that agy's
+  `--sandbox` flag is an orthogonal shell-containment setting,
+  not an "edit preview" mode. Users who need shell containment
+  should set `AGY_EXTRA_ARGS=--sandbox` in their environment.
+- **Tool description** now documents the `mode` and `digest`
+  affordances so the orchestrating model knows about them.
+
 ## [1.0.1] - 2026-07-23
 
 ### Fixed
