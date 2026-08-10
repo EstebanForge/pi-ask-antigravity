@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.3] - 2026-08-10
+
+### Fixed
+
+- **Model parsing now handles agy's real two-column output.** `agy models`
+  prints `<slug>  <display label>` per line, and `--model` accepts only the
+  slug. `parseModelLine` swallowed the whole line and the static
+  `sonnet`/`opus`/`gpt-oss` overlay used display labels, so `--model` was
+  rejected. It now splits column 1; the overlay uses real slugs
+  (`claude-sonnet-4-6`, `claude-opus-4-6-thinking`, `gpt-oss-120b-medium`);
+  and `resolveModel` returns a `{model, effort?}` shape that sends
+  Gemini-family bases' tier to `--effort` while fixed-thinking families keep
+  the exact slug with no `--effort` (agy rejects it for them).
+  `parseModelLine`/`mergeCatalog`/`resolveModel` are now exported, with
+  two-column parser tests on the verified live `agy models` fixture.
+
 ## [1.2.1] - 2026-08-06
 
 ### Changed
