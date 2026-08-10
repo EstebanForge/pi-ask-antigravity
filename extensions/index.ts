@@ -83,13 +83,13 @@ type Mode = "plan" | "accept-edits";
 // whose full string equals the overlay target, the live entry wins. When it
 // does not (older agy, missing model, plan gate), the overlay entry resolves
 // the alias so the user can still type "sonnet" and get a working answer.
-//   "sonnet"   -> Claude Sonnet 4.6 (Thinking)
-//   "opus"     -> Claude Opus 4.6 (Thinking)
-//   "gpt-oss"  -> GPT-OSS 120B (Medium)
+//   "sonnet"   -> claude-sonnet-4-6
+//   "opus"     -> claude-opus-4-6-thinking
+//   "gpt-oss"  -> gpt-oss-120b-medium
 const STATIC_ALIAS_OVERLAY: ReadonlyArray<ModelEntry> = [
-	{ full: "Claude Sonnet 4.6 (Thinking)", family: "other", version: null, tier: null },
-	{ full: "Claude Opus 4.6 (Thinking)", family: "other", version: null, tier: null },
-	{ full: "GPT-OSS 120B (Medium)", family: "other", version: null, tier: null },
+	{ full: "claude-sonnet-4-6", family: "other", version: null, tier: null },
+	{ full: "claude-opus-4-6-thinking", family: "other", version: null, tier: null },
+	{ full: "gpt-oss-120b-medium", family: "other", version: null, tier: null },
 ];
 
 // Short alias → overlay full string. Used by resolveModel to recognize
@@ -97,15 +97,15 @@ const STATIC_ALIAS_OVERLAY: ReadonlyArray<ModelEntry> = [
 // not match. The overlay entries are also merged into the live catalog for
 // exact-string passthrough, so this map only needs to cover the short names.
 const STATIC_SHORT_ALIAS: ReadonlyMap<string, string> = new Map([
-	["sonnet", "Claude Sonnet 4.6 (Thinking)"],
-	["opus", "Claude Opus 4.6 (Thinking)"],
-	["gpt-oss", "GPT-OSS 120B (Medium)"],
+	["sonnet", "claude-sonnet-4-6"],
+	["opus", "claude-opus-4-6-thinking"],
+	["gpt-oss", "gpt-oss-120b-medium"],
 ]);
 
 /** Merge the live catalog with the static alias overlay. Live entries win on
  *  case-insensitive full-string equality so an updated `agy models` listing
  *  always takes precedence over the hardcoded fallback. */
-function mergeCatalog(live: ModelEntry[]): ModelEntry[] {
+export function mergeCatalog(live: ModelEntry[]): ModelEntry[] {
 	const seen = new Set(live.map((e) => e.full.toLowerCase()));
 	const merged = [...live];
 	for (const entry of STATIC_ALIAS_OVERLAY) {
@@ -139,11 +139,20 @@ COMPACT OUTPUT (param: digest): when true, the prompt is prefixed to request com
 type ThinkingTier = "low" | "medium" | "high";
 type Family = "flash" | "pro" | "other";
 
-interface ModelEntry {
-	full: string; // exact agy string, e.g. "Gemini 3.5 Flash (Medium)"
+export interface ModelEntry {
+	full: string; // exact agy slug, e.g. "gemini-3.6-flash-medium"
 	family: Family;
-	version: string | null; // "3.5"
+	version: string | null; // "3.6"
 	tier: ThinkingTier | null;
+}
+
+/** Argv-facing model resolution: the exact --model slug plus an optional
+ *  --effort tier. Gemini bases split the tier out (the base slug alone is
+ *  invalid without --effort); fixed-thinking families keep agy's exact slug
+ *  and carry no effort. */
+export interface ResolvedModel {
+	model: string;
+	effort?: ThinkingTier;
 }
 
 interface Config {
@@ -243,8 +252,11 @@ function saveConfig(patch: Partial<Config>): SaveResult {
 // --- Model parsing + alias resolution --------------------------------------
 
 /** Parse one `agy models` line into a structured entry. */
-function parseModelLine(line: string): ModelEntry | null {
-	const full = line.trim();
+export function parseModelLine(line: string): ModelEntry | null {
+	// agy prints TWO columns: "<slug>  <display label>". --model takes only the
+	// slug (col 1), so split it off; the label is display-only. A bare-slug line
+	// (no whitespace) splits to itself.
+	const full = line.trim().split(/\s+/)[0] ?? "";
 	if (!full) return null;
 
 	const lower = full.toLowerCase();
@@ -257,7 +269,7 @@ function parseModelLine(line: string): ModelEntry | null {
 	const versionMatch = lower.match(/(\d+\.\d+)/);
 	const version = versionMatch ? versionMatch[1] : null;
 
-	const tierMatch = lower.match(/\((low|medium|high)\)/);
+	const tierMatch = lower.match(/-(low|medium|high)$/);
 	const tier = tierMatch ? (tierMatch[1] as ThinkingTier) : null;
 
 	return { full, family, version, tier };
@@ -276,21 +288,34 @@ function nearestTier(available: ThinkingTier[], preferred: ThinkingTier): Thinki
 	return sorted[0] ?? preferred;
 }
 
+/** Build the argv-facing resolution from a picked catalog entry. Gemini bases
+ *  (slugs starting "gemini-") accept a separate --effort, so split the tier
+ *  suffix out of the slug: the base alone (gemini-3.6-flash) is what --model
+ *  wants, and the tier goes to --effort. Fixed-thinking families keep agy's
+ *  exact slug even when it carries a -medium suffix (gpt-oss-120b-medium):
+ *  agy rejects --effort for them, so the suffix stays part of the slug. */
+function toResolved(full: string, tier: ThinkingTier | null): ResolvedModel {
+	if (tier && full.toLowerCase().startsWith("gemini-")) {
+		return { model: full.replace(/-(low|medium|high)$/, ""), effort: tier };
+	}
+	return { model: full };
+}
+
 /**
- * Resolve a friendly alias / partial name to an exact agy model string.
- * Returns null if resolution is not possible (caller passes input through
- * to agy, which may resolve or fail on its own).
+ * Resolve a friendly alias / partial name to an argv-facing {model, effort?}.
+ * Returns null only when the family is unrecognized; the caller then passes
+ * the raw input straight to agy.
  */
-function resolveModel(
+export function resolveModel(
 	input: string,
 	entries: ModelEntry[],
 	defaultThinking: ThinkingTier,
-): string | null {
+): ResolvedModel | null {
 	const lower = input.toLowerCase().trim();
 
 	// 1. Exact full-string match (case-insensitive).
 	const exact = entries.find((e) => e.full.toLowerCase() === lower);
-	if (exact) return exact.full;
+	if (exact) return toResolved(exact.full, exact.tier);
 
 	// 1b. Static short alias ("sonnet" / "opus" / "gpt-oss"). Checked
 	//     before the family parser because none of these names contain
@@ -303,9 +328,8 @@ function resolveModel(
 	//     the model under different casing than the overlay.
 	if (STATIC_SHORT_ALIAS.has(lower)) {
 		const target = STATIC_SHORT_ALIAS.get(lower) as string;
-		const targetLower = target.toLowerCase();
-		const fromCatalog = entries.find((e) => e.full.toLowerCase() === targetLower);
-		return fromCatalog ? fromCatalog.full : target;
+		const fromCatalog = entries.find((e) => e.full.toLowerCase() === target.toLowerCase());
+		return toResolved(fromCatalog?.full ?? target, fromCatalog?.tier ?? null);
 	}
 
 	// 2. Parse the alias.
@@ -365,13 +389,14 @@ function resolveModel(
 	const familyTiers = new Set(
 		candidates.map((e) => e.tier).filter((t): t is ThinkingTier => t !== null),
 	);
-	if (familyTiers.size === 0) return candidates[0].full; // no tiers on any entry
+	if (familyTiers.size === 0) return toResolved(candidates[0].full, null); // no tiers on any entry
 
 	const preferred =
 		tier ??
 		(familyTiers.has(defaultThinking) ? defaultThinking : FAMILY_DEFAULT_TIER[family]);
 	const chosenTier = nearestTier([...familyTiers], preferred);
-	return (candidates.find((e) => e.tier === chosenTier) ?? candidates[0]).full;
+	const picked = candidates.find((e) => e.tier === chosenTier) ?? candidates[0];
+	return toResolved(picked.full, picked.tier);
 }
 
 // --- agy process helpers ---------------------------------------------------
@@ -671,7 +696,7 @@ export default async function (pi: ExtensionAPI) {
 						`  defaultModel:    ${config.defaultModel}`,
 						`  defaultThinking: ${config.defaultThinking}`,
 						`  permissions:     ${config.skipPermissions ? "auto-approved" : "prompt"}`,
-						`  resolved:        ${resolveModel(config.defaultModel, discovered, config.defaultThinking) ?? "(agy default)"}`,
+						`  resolved:        ${resolveModel(config.defaultModel, discovered, config.defaultThinking)?.model ?? "(agy default)"}`,
 						``,
 						`Edit: ~/.pi/agent/ask-antigravity.json`,
 					].join("\n"),
@@ -682,7 +707,7 @@ export default async function (pi: ExtensionAPI) {
 
 			// Resolve the display string for the current default model.
 			const currentResolved =
-				resolveModel(config.defaultModel, discovered, config.defaultThinking) ?? config.defaultModel;
+				resolveModel(config.defaultModel, discovered, config.defaultThinking)?.model ?? config.defaultModel;
 
 			const items: SettingItem[] = [
 				{
@@ -692,7 +717,7 @@ export default async function (pi: ExtensionAPI) {
 						"Friendly alias resolved to the latest matching agy model. 'flash' = latest Flash, 'pro' = latest Pro, 'gemini' = latest Flash.",
 					currentValue: `${config.defaultModel} → ${currentResolved}`,
 					values: MODEL_OPTIONS.map((m) => {
-						const r = resolveModel(m, discovered, config.defaultThinking) ?? m;
+						const r = resolveModel(m, discovered, config.defaultThinking)?.model ?? m;
 						return `${m} → ${r}`;
 					}),
 				},
@@ -877,7 +902,9 @@ export default async function (pi: ExtensionAPI) {
 				};
 			}
 			const resolved =
-				resolveModel(requestedModel, discovered, config.defaultThinking) ?? requestedModel;
+				resolveModel(requestedModel, discovered, config.defaultThinking) ?? {
+					model: requestedModel,
+				};
 
 			const start = Date.now();
 			const cwd = params.cwd || ctx.cwd || process.cwd();
@@ -888,13 +915,13 @@ export default async function (pi: ExtensionAPI) {
 				if (!stat.isDirectory()) {
 					return {
 						content: [{ type: "text", text: `cwd is not a directory: ${cwd}` }],
-						details: emptyDetails(requestedModel, resolved),
+						details: emptyDetails(requestedModel, resolved.model),
 					};
 				}
 			} catch {
 				return {
 					content: [{ type: "text", text: `cwd does not exist: ${cwd}` }],
-					details: emptyDetails(requestedModel, resolved),
+					details: emptyDetails(requestedModel, resolved.model),
 				};
 			}
 
@@ -927,7 +954,8 @@ export default async function (pi: ExtensionAPI) {
 			const args: string[] = ["--add-dir", cwd];
 			const extra = extraArgs();
 			if (extra.length) args.push(...extra);
-			if (resolved) args.push("--model", resolved);
+			if (resolved.model) args.push("--model", resolved.model);
+			if (resolved.effort) args.push("--effort", resolved.effort);
 			args.push("--mode", mode);
 			// accept-edits auto-approves file edits but NOT shell commands, so a
 			// run_command would hang on an unanswerable y/n prompt in non-interactive
@@ -939,7 +967,7 @@ export default async function (pi: ExtensionAPI) {
 
 			const details: AgyDetails = {
 				model: requestedModel,
-				resolvedModel: resolved,
+				resolvedModel: resolved.model,
 				mode,
 				digest: useDigest,
 				conversationId: isContinuation ? (rawConvId as string) : null,
