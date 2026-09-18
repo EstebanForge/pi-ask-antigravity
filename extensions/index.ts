@@ -77,6 +77,24 @@ const FAMILY_DEFAULT_TIER: Record<Family, ThinkingTier> = {
 
 const TIER_RANK: Record<ThinkingTier, number> = { low: 0, medium: 1, high: 2 };
 
+/** pi thinking-level vocabulary -> agy tier, for the thinking/effort tool
+ *  params. Unknown values fall to low (agy always thinks something). */
+function levelToTier(level: string): ThinkingTier {
+	switch (level) {
+		case "minimal":
+		case "low":
+			return "low";
+		case "medium":
+			return "medium";
+		case "high":
+		case "xhigh":
+		case "max":
+			return "high";
+		default:
+			return "low";
+	}
+}
+
 // Mode = which agy tool-loop policy to apply. Distinct from the alias layer.
 //   "plan"         → --mode plan     (no edits; review-only)
 //   "accept-edits" → --mode accept-edits (agy applies edits)
@@ -140,7 +158,12 @@ EXECUTION MODES (param: mode):
 - **accept-edits** (default): agy applies edits directly inside the workspace.
 - For agy's orthogonal \`--sandbox\` shell-containment flag, set the \`AGY_EXTRA_ARGS=--sandbox\` env var.
 
-COMPACT OUTPUT (param: digest): when true, the prompt is prefixed to request compact digests instead of full file contents. Defaults on for plan, off for accept-edits. Use true whenever you do not need full file payloads (review, exploration, planning).`;
+COMPACT OUTPUT (param: digest): when true, the prompt is prefixed to request compact digests instead of full file contents. Defaults on for plan, off for accept-edits. Use true whenever you do not need full file payloads (review, exploration, planning).
+
+THINKING LEVEL (params: thinking, effort - SYNONYMS for one knob):
+- pi calls it thinking, agy calls it effort. Same thing. Pass ONE of the two.
+- Values (pi vocabulary): minimal|low|medium|high|xhigh|max. Clamped to agy's low|medium|high; unknown values fall back to low. "peer review on high thinking" -> thinking: "high".
+- An explicit level beats a tier embedded in model ("flash high") and the configured default. Omit both for the configured default.`;
 
 // --- Types -----------------------------------------------------------------
 
@@ -318,6 +341,10 @@ export function resolveModel(
 	input: string,
 	entries: ModelEntry[],
 	defaultThinking: ThinkingTier,
+	/** Explicit thinking param (thinking/effort). Beats a tier embedded in
+	 *  the alias ("flash high") and the configured default; clamped to the
+	 *  family's real tiers, ignored for fixed-thinking families. */
+	preferredTier?: ThinkingTier,
 ): ResolvedModel | null {
 	const lower = input.toLowerCase().trim();
 
@@ -400,6 +427,7 @@ export function resolveModel(
 	if (familyTiers.size === 0) return toResolved(candidates[0].full, null); // no tiers on any entry
 
 	const preferred =
+		preferredTier ??
 		tier ??
 		(familyTiers.has(defaultThinking) ? defaultThinking : FAMILY_DEFAULT_TIER[family]);
 	const chosenTier = nearestTier([...familyTiers], preferred);
@@ -901,6 +929,18 @@ export default async function (pi: ExtensionAPI) {
 				}),
 			),
 			model: modelParam,
+			thinking: Type.Optional(
+				Type.String({
+					description:
+						"Thinking level (= agy effort tier). pi vocabulary: minimal|low|medium|high|xhigh|max, clamped to agy's low|medium|high. Overrides a tier embedded in `model`. Omit for the configured default.",
+				}),
+			),
+			effort: Type.Optional(
+				Type.String({
+					description:
+						"Alias for `thinking` (agy's own name for the same knob). Pass ONE of the two; different values on both is an error.",
+				}),
+			),
 			mode: Type.Optional(
 				Type.Union(
 					[
@@ -945,8 +985,14 @@ export default async function (pi: ExtensionAPI) {
 			// surface the resolved tier separately for identification.
 			const cfg = loadConfig();
 			const requestedModel = (args.model as string | undefined)?.trim() || cfg.defaultModel;
+			const thinkingArg = (args.thinking as string | undefined) ?? (args.effort as string | undefined);
 			const resolved =
-				resolveModel(requestedModel, discovered, cfg.defaultThinking) ?? { model: requestedModel };
+				resolveModel(
+					requestedModel,
+					discovered,
+					cfg.defaultThinking,
+					thinkingArg ? levelToTier(thinkingArg) : undefined,
+				) ?? { model: requestedModel };
 			const thinking: ThinkingTier = resolved.effort ?? cfg.defaultThinking;
 			const mode: Mode = (args.mode as Mode | undefined) ?? "accept-edits";
 			const useDigest = typeof args.digest === "boolean" ? args.digest : mode === "plan";
@@ -1050,8 +1096,29 @@ export default async function (pi: ExtensionAPI) {
 					details: emptyDetails(requestedModel, null),
 				};
 			}
+			if (
+				typeof params.thinking === "string" &&
+				typeof params.effort === "string" &&
+				params.thinking !== params.effort
+			) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "thinking and effort are synonyms for the same knob - pass one, not both with different values.",
+						},
+					],
+					details: emptyDetails(requestedModel, null),
+				};
+			}
+			const thinkingArg = (params.thinking as string | undefined) ?? (params.effort as string | undefined);
 			const resolved =
-				resolveModel(requestedModel, discovered, config.defaultThinking) ?? {
+				resolveModel(
+					requestedModel,
+					discovered,
+					config.defaultThinking,
+					thinkingArg ? levelToTier(thinkingArg) : undefined,
+				) ?? {
 					model: requestedModel,
 				};
 

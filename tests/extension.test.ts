@@ -121,7 +121,25 @@ describe("parseModelLine + resolveModel (two-column agy output)", () => {
 		});
 	});
 
-	test("resolveModel: short aliases still resolve when agy omits them (static overlay)", () => {
+	test("resolveModel: explicit preferred tier beats alias tier, default, and clamps to the family", () => {
+	// thinking/effort param wins over the alias's own tier and the default.
+	assert.deepEqual(resolveModel("flash high", entries, DEFAULT_THINKING, "low"), {
+		model: "gemini-3.6-flash",
+		effort: "low",
+	});
+	// Pro has no medium variant; the explicit tier clamps to the nearest
+	// listed tier (distance tie low/high -> higher rank wins).
+	assert.deepEqual(resolveModel("pro", entries, DEFAULT_THINKING, "medium"), {
+		model: "gemini-3.1-pro",
+		effort: "high",
+	});
+	// Fixed-thinking families ignore the tier: agy rejects --effort for them.
+	assert.deepEqual(resolveModel("sonnet", entries, DEFAULT_THINKING, "high"), {
+		model: "claude-sonnet-4-6",
+	});
+});
+
+test("resolveModel: short aliases still resolve when agy omits them (static overlay)", () => {
 		const geminiOnly = mergeCatalog(
 			[
 				"gemini-3.6-flash-high   Gemini 3.6 Flash (High)",
