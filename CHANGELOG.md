@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.5] - 2026-09-18
+
+### Added
+
+- **`thinking` / `effort` params on AskAntigravity (synonyms).** Port of the pi-antigravity-bridge fix: delegation calls had no direct tier knob (only tier sugar inside `model`, "flash high"), so a caller told "peer review on high thinking" fell through to the configured default with no signal anything was dropped. `thinking` takes pi vocabulary (minimal|low|medium|high|xhigh|max, clamped to agy's low|medium|high; unknown values fall back to low) and `effort` is the same knob under agy's own name. Explicit level beats a tier embedded in `model` and the config default; different values on both errors; fixed-thinking families ignore it because agy rejects `--effort` for them.
+
 ## [1.2.4] - 2026-08-13
 
 ### Added
